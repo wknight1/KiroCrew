@@ -5730,13 +5730,21 @@ class SlotCloseError(Exception):
 def _release_closed_execution(
     state: DashboardState, slot: "_ChatSlot", session_key: str, execution
 ) -> None:
-    """Release restricted identity after its last consumer and provider stop."""
+    """Release a session's held identity after its last consumer and provider stop."""
     from kiro_crew.execution_context import clear_session_execution
 
-    if execution is not None and execution.memory_mode != "persistent":
-        # A queued-prompt executor may start after the live carrier is released.
-        # Keep the retired slot restricted so that late flush still cannot write.
-        slot.memory_mode = execution.with_mode(slot.memory_mode).memory_mode
+    # Persistent sessions are released here too, not restricted ones alone. A
+    # persistent session is now vouched for by this process when it is admitted,
+    # and an entry that is published but never withdrawn would keep one row per
+    # session for the whole life of the process. The release itself is unchanged:
+    # it still waits for the closing tasks, still declines while another live slot
+    # or a provider holds this session key, and still withdraws under
+    # compare-and-set so a newer identity cannot be erased.
+    if execution is not None:
+        if execution.memory_mode != "persistent":
+            # A queued-prompt executor may start after the live carrier is released.
+            # Keep the retired slot restricted so that late flush still cannot write.
+            slot.memory_mode = execution.with_mode(slot.memory_mode).memory_mode
         closing_tasks = tuple(
             task
             for task in (slot.task, getattr(slot, "_eager_spawn_task", None))
@@ -5831,10 +5839,10 @@ async def _close_slot(
     # close observed the already-terminal record, leaving an active orphan.
     slot.begin_close()
     closed_at = note_slot_closed(state, name)
-    from kiro_crew.execution_context import read_live_session_execution
+    from kiro_crew.execution_context import read_held_session_execution
 
     closing_key = effective_session_key(slot)
-    closing_execution = read_live_session_execution(closing_key)
+    closing_execution = read_held_session_execution(closing_key)
     # Retire the auto-nudge loop BEFORE the awaits below, so no nudge can expire
     # into the session being closed and resurrect it. See
     # _retire_slot_nudge_loop for why disarming alone does not hold.
@@ -6323,14 +6331,14 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
     archived: list[str] = []
     failed: list[str] = []
     _tasks_to_cancel: list[asyncio.Task] = []
-    from kiro_crew.execution_context import read_live_session_execution
+    from kiro_crew.execution_context import read_held_session_execution
 
     for name in stale_keys:
         candidate = state._slots.get(name)
         if candidate is None:
             continue
         closing_key = effective_session_key(candidate)
-        closing_execution = read_live_session_execution(closing_key)
+        closing_execution = read_held_session_execution(closing_key)
         if state._slots.get(name) is not candidate:
             continue
         removed = state._slots.pop(name, None)

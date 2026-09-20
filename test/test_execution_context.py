@@ -18,6 +18,7 @@ def members(tmp_path, monkeypatch):
 
     loader._invalidate_config_cache()
     execution._LIVE_EXECUTIONS.clear()
+    execution._VOUCHED_EXECUTIONS.clear()
     cfg = SimpleNamespace(agents={}, memory_stores={})
     for name in ("alice", "bob"):
         store = f"member-{name}"
@@ -33,6 +34,7 @@ def members(tmp_path, monkeypatch):
     monkeypatch.setattr(loader.KiroCrewConfig, "load", classmethod(lambda cls: cfg))
     yield cfg
     execution._LIVE_EXECUTIONS.clear()
+    execution._VOUCHED_EXECUTIONS.clear()
 
 
 def test_database_identity_path_and_cross_member_routing(members):
@@ -217,6 +219,7 @@ def test_repeated_retention_tightening_survives_restart_without_new_body(members
     execution.bind_session_execution(key, admitted.with_mode("incognito"))
     execution.bind_session_execution(key, admitted.with_mode("temporary"))
     execution._LIVE_EXECUTIONS.clear()
+    execution._VOUCHED_EXECUTIONS.clear()
     restored = execution.read_session_execution(key, required=True)
     assert restored.memory_mode == "temporary"
     assert restored.store == admitted.store
@@ -234,6 +237,74 @@ def test_cancelled_restricted_selection_preserves_strongest_retention(members):
     restored = execution.read_session_execution("dashboard_cancelled", required=True)
     assert restored.member_id == admitted.member_id
     assert restored.memory_mode == "temporary"
+
+
+def test_cancelled_persistent_selection_rolls_the_vouched_identity_back(members):
+    # A persistent session has no live carrier, so the rollback reports False and
+    # its caller undoes the durable record itself. The vouched entry has to come
+    # back with it. Left on the abandoned store, it would let a session that can
+    # rewrite its own record move that record back and re-establish agreement --
+    # which is the forgery the agreement requirement exists to refuse, reached
+    # through a rollback rather than a fresh claim.
+    #
+    # `restore_agent_selection` routes every rollback through this one seam before
+    # it touches the record, so the seam is where the withdrawal belongs.
+    admitted = execution.resolve_member_execution(members, "alice")
+    published = execution.resolve_member_execution(members, "bob")
+    key = "dashboard:cancelled-persistent"
+    execution.bind_session_execution(key, admitted)
+    execution.bind_session_execution(key, published, replace_existing=True)
+    # Precondition: the switch really did vouch for bob, so a failure below means
+    # the rollback did not withdraw rather than that nothing was published.
+    assert execution.read_vouched_session_execution(key).member_id == published.member_id
+    # False is the persistent path: no live carrier for the rollback to undo.
+    assert not execution.restore_live_session_execution(
+        key, admitted.to_record(), published.to_record()
+    )
+    assert execution.read_vouched_session_execution(key).member_id == admitted.member_id
+
+
+def test_a_restart_re_vouches_a_member_from_config_not_from_the_record(members):
+    # The map is process-local, so every session loses its vouched entry when the
+    # process dies while its durable record survives. Simulated by emptying the
+    # map and leaving the record alone.
+    #
+    # The per-turn selection path re-establishes it, and the value it vouches for
+    # comes from CONFIG, not from the record it happens to agree with -- so the two
+    # sources the own-store admission compares stay independent. Without this a
+    # rehydrated member session would lose the own-store authority its record still
+    # earns, and every fenced same-store dispatch would 403 until an owner
+    # re-selected the agent.
+    from types import SimpleNamespace
+
+    from kiro_crew.session_agent_selection import _revision, record_agent_selection
+
+    admitted = execution.resolve_member_execution(members, "alice")
+    key = "dashboard:restarted-member"
+    execution.bind_session_execution(key, admitted)
+    assert execution.read_vouched_session_execution(key) == admitted
+
+    execution._VOUCHED_EXECUTIONS.clear()
+    # Precondition: the restart really did drop it, so a pass below is the
+    # re-vouch rather than a leftover entry.
+    assert execution.read_vouched_session_execution(key) is None
+    stored = execution.read_session_execution(key)
+    assert stored == admitted
+
+    bindings = SimpleNamespace(
+        selection_kind="member",
+        resolved_alias="alice",
+        requested_resolved=True,
+        # The guard compares a content hash of the stored record, not a field on
+        # it, so that is what a real resolver hands over.
+        selection_revision=_revision(stored),
+        execution_context=stored,
+        kiro_agent=stored.template_id,
+        memory_store=stored.store.legacy_name,
+    )
+    # No change to publish, so this returns None and writes no record.
+    assert record_agent_selection(key, "alice", bindings) is None
+    assert execution.read_vouched_session_execution(key) == admitted
 
 
 def test_old_close_cannot_clear_reused_session_identity(members):

@@ -18,6 +18,7 @@ from kiro_crew.execution_context import (
     MemoryStoreRef,
     bind_session_execution,
     read_session_execution,
+    read_vouched_session_execution,
 )
 from kiro_crew.history import ConversationLog
 
@@ -85,6 +86,25 @@ async def test_close_releases_only_own_live_execution(tmp_path, monkeypatch, mod
     assert replacement.memory_mode == "persistent"
     bind_session_execution(key, _execution("persistent"))
     assert read_session_execution(key).memory_mode == "persistent"
+
+
+@pytest.mark.asyncio
+async def test_close_withdraws_a_persistent_sessions_vouched_identity(tmp_path, monkeypatch):
+    # Driven through the real `close_slot`, never through the release helper. A
+    # persistent session is held ONLY in the vouched map, so a close path that
+    # reads the live carrier alone gets None, skips the release entirely, and
+    # leaks the entry for the life of the process. A test that called the helper
+    # directly would pass while that happened, because the helper is not the part
+    # that was wrong.
+    monkeypatch.setattr("kiro_crew.autonudge._INSTANCE", None)
+    state, slot, key = _state(tmp_path)
+    execution = _execution("persistent")
+    bind_session_execution(key, execution)
+    # Precondition, so a failure below means the release did not fire rather than
+    # that nothing was ever published.
+    assert read_vouched_session_execution(key) == execution
+    await close_slot(state, slot, slot.key)
+    assert read_vouched_session_execution(key) is None
 
 
 @pytest.mark.asyncio

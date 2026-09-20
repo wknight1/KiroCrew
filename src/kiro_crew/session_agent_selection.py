@@ -16,6 +16,7 @@ from kiro_crew.execution_context import (
     member_config_for_id,
     read_session_execution,
     resolve_member_execution,
+    vouch_session_execution,
 )
 from kiro_crew.memory_stores import UnknownMemoryStore
 
@@ -137,6 +138,16 @@ def record_agent_selection(session_key, agent_name, bindings, *, replace=False, 
     if memory_mode is not None:
         execution = execution.with_mode(memory_mode)
     if prior == execution and not replace:
+        # Nothing to publish: the record already says what config resolves to. But
+        # this process may hold no vouched identity for the session, which is the
+        # state every session is in after a restart, since that map is
+        # process-local and no rehydrate path binds. Vouch here so a rehydrated
+        # member session keeps the own-store authority its record already earns.
+        #
+        # `execution` is the value resolved from CONFIG above, never one read back
+        # from the record, so the two sources the own-store admission compares stay
+        # independent instead of collapsing into the one the session writes.
+        vouch_session_execution(session_key, execution)
         return None
     execution = dataclass_replace(execution, selection_revision=uuid.uuid4().hex)
     # The comparison above is backed by the session record CAS during publication.

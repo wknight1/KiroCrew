@@ -14,6 +14,19 @@ EXECUTION_CONTEXT_KEY = "execution_context"
 MEMORY_MODES = ("persistent", "incognito", "temporary")
 # Restricted sessions own their record in memory for their lifetime.
 _LIVE_EXECUTIONS: dict[tuple[str, str], ExecutionContext] = {}
+# What THIS process committed as a session's identity, for the one question the
+# durable record cannot answer with authority: "which store does that OTHER
+# session belong to?" The record is metadata on the session's own transcript, so
+# the session being asked about is the party that writes it.
+#
+# Deliberately NOT consulted by `read_session_execution`. Several modules publish
+# an execution record by its literal key without going through
+# `bind_session_execution` (agent selection, the task runner, workflows,
+# subagents, MCP control), so a map that shadowed that reader would serve a stale
+# identity for the rest of the session after any of them wrote. Keeping this map
+# off that path means it can only ever be consulted by a caller that has decided
+# it wants THIS process's word rather than the record's.
+_VOUCHED_EXECUTIONS: dict[tuple[str, str], ExecutionContext] = {}
 _EXECUTION_LOCK = RLock()
 
 
@@ -30,6 +43,12 @@ def clear_session_execution(
         key = _live_key(session_key)
         if expected is ... or _LIVE_EXECUTIONS.get(key) == expected:
             _LIVE_EXECUTIONS.pop(key, None)
+        # The vouched entry is withdrawn under its OWN compare-and-set, not the
+        # one above. A persistent session never had a live carrier, so keying
+        # this withdrawal on `_LIVE_EXECUTIONS` would compare against None, never
+        # fire, and leave the entry alive for the rest of the process.
+        if expected is ... or _VOUCHED_EXECUTIONS.get(key) == expected:
+            _VOUCHED_EXECUTIONS.pop(key, None)
 
 
 def _unavailable(message: str):
@@ -262,6 +281,60 @@ def read_live_session_execution(session_key: str) -> ExecutionContext | None:
         return _LIVE_EXECUTIONS.get(_live_key(session_key))
 
 
+def read_vouched_session_execution(session_key: str) -> ExecutionContext | None:
+    """This process's own word on *session_key*'s identity, or None.
+
+    None is a real answer and the safe one: it means this process has not
+    committed an identity for that session under the home in force, so a caller
+    deciding whether the session may reach a private store has nothing to go on
+    and must refuse. It is never a licence to fall back to the durable record --
+    the record is what the subject session writes, so falling back would hand the
+    subject the answer to a question about itself.
+    """
+    with _EXECUTION_LOCK:
+        return _VOUCHED_EXECUTIONS.get(_live_key(session_key))
+
+
+def read_held_session_execution(session_key: str) -> ExecutionContext | None:
+    """Whatever identity THIS process holds for *session_key*, live or vouched.
+
+    Close paths want this rather than either map on its own. A restricted session
+    is held in the live carrier and a persistent one only in the vouched map, so a
+    close that consults one map releases half the sessions and leaks the other
+    half for the life of the process. Live is preferred where both answer, which
+    keeps a restricted session's release byte-for-byte what it was.
+    """
+    with _EXECUTION_LOCK:
+        key = _live_key(session_key)
+        held = _LIVE_EXECUTIONS.get(key)
+        if held is not None:
+            return held
+        return _VOUCHED_EXECUTIONS.get(key)
+
+
+def vouch_session_execution(session_key: str, execution: ExecutionContext) -> None:
+    """Record this process's word on an identity the durable record already agrees with.
+
+    For the case where a session's record already says what config resolves to, so
+    there is nothing to publish, and yet this process holds no vouched entry at
+    all. That is the state EVERY session is in after a restart, because the map is
+    process-local by design and no rehydrate path binds.
+
+    The caller must pass an execution derived from CONFIG, never one read back from
+    the session's own record. Seeding from the record would collapse the two
+    independent sources the own-store admission compares into a single one the
+    session itself writes, which is the whole thing that admission refuses.
+
+    Restricted sessions are skipped: they are held in the live carrier instead, the
+    admission refuses them before the store question is reached, and a persistent
+    bind that later turns restricted has its vouched entry withdrawn.
+    """
+    if not session_key or execution.memory_mode != "persistent":
+        return
+    with _EXECUTION_LOCK:
+        _VOUCHED_EXECUTIONS[_live_key(session_key)] = execution
+
+
 @overload
 def read_session_execution(session_key: str, *, required: Literal[True]) -> ExecutionContext: ...
 
@@ -392,6 +465,12 @@ def bind_session_execution(
             if latest is not None and latest != current:
                 raise _unavailable("session changed during admission")
             _LIVE_EXECUTIONS[_live_key(session_key)] = execution
+            # A session that has just become restricted stops being vouched for.
+            # Nothing downstream would admit it anyway, since a restricted caller
+            # is refused before the store question is reached, but leaving a
+            # persistent-era entry behind would leave this map disagreeing with
+            # the record it exists to corroborate.
+            _VOUCHED_EXECUTIONS.pop(_live_key(session_key), None)
         return
     expected = current.to_record() if current is not None else None
     fields = {
@@ -403,12 +482,40 @@ def bind_session_execution(
         session_key, fields, lambda meta: meta.get(EXECUTION_CONTEXT_KEY) == expected
     ):
         raise _unavailable("session changed during admission")
+    # Vouch for what was just committed, AFTER the compare-and-set above, so this
+    # process never vouches for an identity the durable record does not carry.
+    #
+    # No compare-and-set of its own, unlike the restricted branch above, and the
+    # asymmetry is deliberate: that branch has no durable CAS to lean on, while
+    # this path is already serialised by the one that just succeeded. Two
+    # concurrent persistent admissions read the same `current`, so the loser's CAS
+    # fails and it raises above without ever reaching this line. The winner
+    # therefore owns the vouched entry.
+    with _EXECUTION_LOCK:
+        _VOUCHED_EXECUTIONS[_live_key(session_key)] = execution
 
 
 def restore_live_session_execution(session_key: str, prior, published) -> bool:
     """CAS rollback a restricted admission; False means use the durable owner."""
     with _EXECUTION_LOCK:
         key = _live_key(session_key)
+        # The vouched entry rolls back on its OWN terms, before and regardless of
+        # what the live carrier says. A persistent session has no live carrier, so
+        # the `current is None` return below would otherwise leave this process
+        # still vouching for an identity the rollback has just abandoned -- and a
+        # session that can rewrite its own record could then move that record back
+        # to the abandoned store and re-establish agreement, which is exactly the
+        # forgery the agreement requirement exists to refuse.
+        #
+        # Same compare-and-set shape as the carrier: only withdraw what THIS
+        # admission published, so a newer identity is never erased.
+        vouched = _VOUCHED_EXECUTIONS.get(key)
+        if vouched is not None and vouched.to_record() == published:
+            if prior is None:
+                _VOUCHED_EXECUTIONS.pop(key, None)
+            else:
+                restored = execution_from_record({EXECUTION_CONTEXT_KEY: prior})
+                _VOUCHED_EXECUTIONS[key] = restored.with_mode(vouched.memory_mode)
         current = _LIVE_EXECUTIONS.get(key)
         if current is None:
             return False
