@@ -430,6 +430,13 @@ export interface DecisionsConsentData {
    * consent recorded before this existed authorizes only what its owner reviewed.
    */
   tool_args?: boolean
+  /**
+   * Whether the owner consented to sending THE TEXT OF RECALLED MEMORIES — the extra
+   * egress category `memory.recall` needs. Absent reads as not consented, on the same
+   * terms as `tool_args`: a recalled memory is text the agent wrote down in an earlier
+   * conversation, so consent recorded against a message excerpt cannot stand for it.
+   */
+  memory_text?: boolean
 }
 
 /** Which side of a logged decision a reader's verdict is about. */
@@ -4935,14 +4942,35 @@ export const api = {
   getDecisionsConsent: () => get('/api/decisions/consent').then(j) as Promise<DecisionsConsentData>,
   // Enabling echoes the endpoint the card showed: the gateway binds consent to
   // that address and answers 409 if config.json moved it since the read.
-  // `toolArgs` is OMITTED when the caller does not pass one, and that omission is
-  // meaningful: the gateway preserves the recorded scope for an absent field, so
-  // an ordinary switch flip can neither grant nor erase it. Pass a boolean only
-  // when the owner acted on the tool-argument switch itself.
-  saveDecisionsConsent: (enabled: boolean, endpoint?: string, toolArgs?: boolean) =>
+  // Each field is OMITTED when the caller does not pass it, and every omission is
+  // meaningful: the gateway PRESERVES what it already recorded for an absent field,
+  // resolved inside its own write lock. So an ordinary switch flip can neither grant
+  // nor erase a scope, and — see `saveDecisionsScope` below — a scope write can say
+  // nothing at all about consent.
+  saveDecisionsConsent: (
+    enabled: boolean,
+    endpoint?: string,
+    scopes?: { toolArgs?: boolean; memoryText?: boolean },
+  ) =>
     put('/api/decisions/consent', enabled
-      ? (toolArgs === undefined ? { enabled, endpoint } : { enabled, endpoint, tool_args: toolArgs })
+      ? {
+        enabled,
+        endpoint,
+        ...(scopes?.toolArgs === undefined ? {} : { tool_args: scopes.toolArgs }),
+        ...(scopes?.memoryText === undefined ? {} : { memory_text: scopes.memoryText }),
+      }
       : { enabled }).then(j) as Promise<DecisionsConsentData>,
+  // A SCOPE-ONLY write: the body carries the scope field and nothing else, so it
+  // asserts nothing about whether the seam may send. `enabled` is deliberately absent
+  // rather than set to the value the card holds — that value comes from a read which a
+  // concurrent revoking PUT makes stale, and writing it back would re-commit a consent
+  // the owner had just withdrawn. The gateway preserves the recorded flag AND the
+  // recorded endpoint for an absent `enabled`, so there is nothing to echo either.
+  saveDecisionsScope: (scopes: { toolArgs?: boolean; memoryText?: boolean }) =>
+    put('/api/decisions/consent', {
+      ...(scopes.toolArgs === undefined ? {} : { tool_args: scopes.toolArgs }),
+      ...(scopes.memoryText === undefined ? {} : { memory_text: scopes.memoryText }),
+    }).then(j) as Promise<DecisionsConsentData>,
   // One reader's verdict on one side of one decision, from the transcript's
   // decision strip. `verdict: null` takes an answer back, which is why the field
   // is nullable rather than absent — the server records the retraction.

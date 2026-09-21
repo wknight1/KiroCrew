@@ -175,6 +175,11 @@ def _payload(state: dict, *, denied: bool) -> dict:
         # guessing from ``enabled``: a record written before this scope existed reads
         # false here, which is what the card must draw for it.
         "tool_args": consent.consented_tool_args(state),
+        # Whether the owner consented to sending the TEXT OF RECALLED MEMORIES, on
+        # the same terms and reported for the same reason: a record written before
+        # this scope existed reads false here, which is what the card must draw for
+        # it rather than inferring the scope from ``enabled``.
+        "memory_text": consent.consented_memory_text(state),
     }
 
 
@@ -221,6 +226,12 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     had it reads as false, which is what keeps a consent given before this scope
     existed meaning only what its owner reviewed.
 
+    ``memory_text`` records the same answer for the TEXT OF RECALLED MEMORIES, the
+    category ``memory.recall`` needs, on identical terms. Two independent fields
+    because they are two independent decisions: an owner may want risky tool calls
+    flagged without the contents of their memory store leaving the machine, and
+    either order of those answers has to be recordable.
+
     ``history_budget_chars`` records the prior-conversation CEILING the owner
     reviewed, and it is here for the same reason ``endpoint`` is: the value in force
     lives in agent-writable ``config.json``, so a budget recorded only there could be
@@ -257,8 +268,16 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid JSON", "code": _CODE_INVALID_JSON}, status=400)
     # A strict bool, for the same reason the keystone read is a strict identity
     # test: ``"true"`` and ``1`` are not consent.
-    enabled = body.get("enabled") if isinstance(body, dict) else None
-    if not isinstance(enabled, bool):
+    #
+    # ABSENT is its own case, and it is what a scope-only write sends: the card's scope
+    # switches say nothing about whether the seam may send, so they must not carry a
+    # verdict on it. Absent is handed on as ``KEEP_ENABLED``, resolved inside the
+    # writer's own read-modify-write with the recorded endpoint, so a scope click cannot
+    # assert a consent state -- not even the one the card had just read, which a
+    # concurrent revoking PUT makes wrong. A body that is not an object at all is still
+    # a 400: that is a malformed request, not an omission.
+    enabled = body.get("enabled", consent.KEEP_ENABLED) if isinstance(body, dict) else None
+    if enabled is not consent.KEEP_ENABLED and not isinstance(enabled, bool):
         await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
         return web.json_response(
             {"error": 'body must be {"enabled": true|false}', "code": _CODE_INVALID_BODY},
@@ -310,6 +329,20 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
             status=400,
         )
 
+    # The recalled-memory scope, read and validated on exactly the terms above: the
+    # sentinel is handed on rather than resolved here so the writer resolves it from
+    # the same read its write is based on, and a truthy stand-in is a 400 rather than
+    # a silent yes about a new egress category.
+    memory_text = (
+        body.get("memory_text", consent.KEEP_MEMORY_TEXT) if isinstance(body, dict) else False
+    )
+    if memory_text is not consent.KEEP_MEMORY_TEXT and not isinstance(memory_text, bool):
+        await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
+        return web.json_response(
+            {"error": '"memory_text" must be true or false', "code": _CODE_INVALID_BODY},
+            status=400,
+        )
+
     # Bound to the endpoint the owner REVIEWED, checked against the one the
     # config names now. Equal: consent is for the address on screen, and the one
     # the gate will hold the config to afterwards. Different: the config moved
@@ -321,23 +354,31 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     from kiro_crew.decisions.capability import is_decisions_denied
 
     withdrawn = await asyncio.to_thread(is_decisions_denied)
-    if enabled:
-        # The fleet's ceiling, ahead of every other check on an enabling write: a
-        # withdrawn seam must not acquire a keystone that says otherwise. Only the
-        # ENABLING direction is gated -- a disabling PUT stays available so an owner
-        # can clear a consent recorded before the pin (the gate already reads it as
-        # off, so the write changes no authority, it only tidies the record).
-        if withdrawn:
-            await _audit(
-                request, operation=OP_CONSENT_PUT, outcome="denied", error="capability_denied"
-            )
-            return web.json_response(
-                {
-                    "error": "the decision seam is withdrawn by governance policy",
-                    "code": _CODE_CAPABILITY_DENIED,
-                },
-                status=403,
-            )
+    # What the fleet ceiling is held against is whether this write GRANTS something:
+    # consent itself, or an egress scope. Only a grant is gated -- a disabling or
+    # revoking PUT stays available so an owner can clear a record written before the pin
+    # (the gate already reads it as off, so the write changes no authority, it only
+    # tidies the record), and trapping them with a stale `"enabled": true` they cannot
+    # clear would be worse than the record.
+    #
+    # A scope-only write is in scope for this: it carries ``KEEP_ENABLED`` and therefore
+    # asserts nothing about consent, but turning a scope ON under a pin would still
+    # record an egress permission the fleet has withdrawn.
+    grants = enabled is True or tool_args is True or memory_text is True
+    if grants and withdrawn:
+        await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="capability_denied")
+        return web.json_response(
+            {
+                "error": "the decision seam is withdrawn by governance policy",
+                "code": _CODE_CAPABILITY_DENIED,
+            },
+            status=403,
+        )
+    # ``is True``, not truthiness: ``enabled`` may be the ``KEEP_ENABLED`` sentinel,
+    # which is an object and therefore truthy. Only a write that actually turns consent
+    # on has to echo the reviewed address -- a scope-only write is not consenting to an
+    # address, it is leaving the recorded one exactly as it is.
+    if enabled is True:
         reviewed = consent.normalize_endpoint(body.get("endpoint"))
         if not reviewed:
             await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
@@ -367,6 +408,7 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
             endpoint=endpoint,
             history_budget_chars=budget,
             tool_args=tool_args,
+            memory_text=memory_text,
         )
     except consent.ConsentCorruptError as exc:
         await _audit(request, operation=OP_CONSENT_PUT, outcome="error", error="corrupt")
@@ -381,11 +423,16 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     await _audit(
         request,
         operation=OP_CONSENT_PUT,
-        outcome="granted" if enabled else "revoked",
+        # Read off the STATE that was written, not off the request: a scope-only
+        # write carries the sentinel, which is truthy, and would have audited as
+        # "granted" while asserting nothing about consent. The recorded flag is what
+        # an auditor reconstructing "when did egress start" needs.
+        outcome="granted" if consent.is_enabled(state) else "revoked",
         resources=(
             f"decisions_consent.json endpoint={endpoint} "
             f"history_budget_chars={consent.consented_history_budget(state)} "
-            f"tool_args={consent.consented_tool_args(state)}"
+            f"tool_args={consent.consented_tool_args(state)} "
+            f"memory_text={consent.consented_memory_text(state)}"
         ),
     )
     return web.json_response(_payload(state, denied=withdrawn))

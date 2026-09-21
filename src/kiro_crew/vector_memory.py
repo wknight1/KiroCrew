@@ -1266,6 +1266,55 @@ def open_member_database(
     return store
 
 
+#: Characters of one episode's text the injected block carries. Named because two
+#: readers need the same number: the block builder clips to it, and
+#: ``decisions/points/memory_recall.py`` measures a decision's saving against the
+#: same clip. A literal in one place and a different literal in the other would
+#: make the saving a number about a block nobody assembled.
+EPISODIC_BLOCK_TEXT_CHARS = 1500
+
+
+def _kept_episodes(
+    results: list[dict],
+    keep: Callable[[list[dict]], list[dict] | None] | None,
+) -> list[dict]:
+    """*results* narrowed by *keep*, or *results* unchanged.
+
+    Every unusable answer keeps the full similarity result, which is what this
+    module did before a hook existed: ``None`` (no decision), a raise, a
+    non-sequence, and a row the search did not produce. The last one matters most
+    -- a hook is allowed to REMOVE entries and nothing else, so an answer carrying
+    an unknown row is treated as unusable rather than injected, and an injected
+    block can never hold a memory this search did not rank.
+
+    Identity, not equality, is what membership is judged on: two distinct episodes
+    can hold equal dicts, and a membership test by value would let one answer
+    admit the other.
+    """
+    if keep is None:
+        return results
+    try:
+        narrowed = keep(list(results))
+    except Exception:
+        logger.debug("Episodic keep hook failed; injecting the similarity result")
+        return results
+    if narrowed is None:
+        return results
+    if not isinstance(narrowed, list):
+        logger.debug(
+            "Episodic keep hook returned %s; injecting the similarity result", type(narrowed)
+        )
+        return results
+    offered = {id(row) for row in results}
+    if any(id(row) not in offered for row in narrowed):
+        logger.debug("Episodic keep hook named a row this search did not rank; injecting it whole")
+        return results
+    # Ranked order is this module's, so the hook's own ordering is discarded: it
+    # answered a keep/drop question, which says nothing about rank.
+    chosen = {id(row) for row in narrowed}
+    return [row for row in results if id(row) in chosen]
+
+
 class VectorMemoryStore:
     """SQLite-backed structured memory with semantic keys and audit trail."""
 
@@ -4832,12 +4881,34 @@ class VectorMemoryStore:
         query_embedding: list[float] | None = None,
         query_text: str = "",
         cap: int = 3000,
+        *,
+        keep: Callable[[list[dict]], list[dict] | None] | None = None,
     ) -> str:
         """Format episodic search results for prompt injection.
 
         Results below the length-aware cosine relevance gate are dropped by
         ``search_episodic(relevance_filter=True)`` BEFORE decay ranking, so a
         relevant-but-old memory is admitted rather than ordered out by recency.
+
+        *keep*, when given, may narrow the ranked set before it is formatted; it
+        returns ``None`` to keep every result. It is the seam the
+        ``memory.recall`` decision point attaches to
+        (``decisions/points/memory_recall.py``), and it is a callable rather than
+        a filtered list so this method still owns the search: a hook that raises,
+        returns a non-list, or names rows this search did not produce leaves the
+        similarity result exactly as it is. Order stays this method's own —
+        entries are kept in ranked order and a hook can only remove some of them
+        — because a keep/drop answer says nothing about rank.
+
+        The CHAR CAP is applied BEFORE the hook, not after, and the ordering is the
+        point. The cap is what decides which of the ranked rows this block would have
+        carried, so a hook shown the whole result could drop a high-ranked row and
+        thereby free budget for a lower-ranked one the cap had already excluded —
+        which is the hook ADDING a memory the block would not have carried, the one
+        thing it must not be able to do. So the cap-admitted rows are the baseline the
+        hook is offered, and what it hands back is formatted as-is: removing rows only
+        shortens the lines (the indices shrink), so the result stays inside the cap
+        without a second pass.
         """
         if query_embedding is None and query_text and self.embed_fn is not None:
             query_embedding = self._try_embed(query_text, PRIORITY_INTERACTIVE)
@@ -4849,26 +4920,64 @@ class VectorMemoryStore:
         )
         if not results:
             return ""
-        lines: list[str] = []
-        total = 0
-        for i, r in enumerate(results, 1):
-            text = r["text"][:1500]
-            line = f"{i}. {text}"
-            if self.algorithm_version == "v2":
-                line = f"{i}. [memory:{r['id']}] {text}"
-            if total + len(line) > cap:
-                if self.algorithm_version == "v2":
-                    continue
-                break
-            lines.append(line)
-            total += len(line) + 1
-        if not lines:
+        admitted = self._cap_admitted_episodes(results, cap)
+        if not admitted:
             return ""
+        kept = _kept_episodes([row for _index, row in admitted], keep)
+        if not kept:
+            return ""
+        # Each row keeps the RANK it was measured under, never a fresh 1..n counter.
+        # Two reasons, and the first one is a correctness bug rather than cosmetics: the
+        # cap walk measured `self._episode_line(rank, row)`, so emitting a different
+        # number makes the cap a bound on a string nobody rendered. And on the v2
+        # lineage the admitted set can have GAPS -- an over-budget row is skipped and
+        # the walk continues -- so renumbering tells the model the third line is the
+        # third-best memory when it is the fourth-ranked one.
+        by_id = {id(row): index for index, row in admitted}
+        lines = [self._episode_line(by_id[id(row)], row) for row in kept]
         return (
             "[Episodic Memory — relevant past conversation fragments.]\n"
             + "\n".join(lines)
             + "\n[End of episodic memory]\n"
         )
+
+    def _episode_line(self, index: int, row: dict) -> str:
+        """One block line for *row* at 1-based *index*.
+
+        The one place the line is built, so the cap walk below and the block above
+        measure and emit the same string. Two copies of this format drifted apart
+        would make the cap a bound on a line nobody rendered.
+        """
+        text = row["text"][:EPISODIC_BLOCK_TEXT_CHARS]
+        if self.algorithm_version == "v2":
+            return f"{index}. [memory:{row['id']}] {text}"
+        return f"{index}. {text}"
+
+    def _cap_admitted_episodes(self, results: list[dict], cap: int) -> list[tuple[int, dict]]:
+        """The ranked rows *cap* admits, as ``(rank, row)`` in rank order.
+
+        The RANK travels with the row because the admitted set can have gaps: on the v2
+        lineage a row that does not fit is SKIPPED and the walk continues, so a later
+        shorter row can still be admitted; on v1 an over-budget row STOPS the walk. That
+        difference predates the decision seam and is not this method's to change, but it
+        means position in this list is not rank, and the caller needs rank -- both to
+        emit the number it measured and to keep the ranked order legible to the model.
+
+        Extracted so the cap can be applied before a ``keep`` hook rather than during
+        formatting. Same arithmetic as the formatter it came from, including the ``+
+        1`` per line for the newline the join adds.
+        """
+        admitted: list[tuple[int, dict]] = []
+        total = 0
+        for index, row in enumerate(results, 1):
+            line = self._episode_line(index, row)
+            if total + len(line) > cap:
+                if self.algorithm_version == "v2":
+                    continue
+                break
+            admitted.append((index, row))
+            total += len(line) + 1
+        return admitted
 
     # ── Facets: reading a carve back out ──
 

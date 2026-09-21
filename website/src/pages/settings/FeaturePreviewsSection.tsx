@@ -215,15 +215,38 @@ function DecisionsPreviewCard() {
     // wrote the same value again.
     onSettled: () => qc.invalidateQueries({ queryKey: ['decisionsConsent'] }),
   })
-  // The tool-argument scope is a SECOND consent, so it is a second write: it sends
-  // `enabled: true` alongside, because the scope is only meaningful while the seam
-  // is on and the route records both under one lock. Its own pending state, so the
-  // two switches disable independently rather than one freezing the other.
+  // A scope is a SECOND consent, so each is its own write against the same route --
+  // and it carries the scope field ALONE.
+  //
+  // No `enabled` at all, not even the value the card currently holds. That value comes
+  // from a read, and a concurrent revoking PUT makes it stale inside the window: writing
+  // it back would re-commit a consent the owner had just withdrawn, from a click that
+  // was about a scope. Saying nothing about consent is the only shape that cannot. The
+  // gateway preserves the recorded flag and the recorded endpoint for an absent
+  // `enabled` (`consent.KEEP_ENABLED`, resolved inside its own write lock), so there is
+  // nothing to echo either.
+  //
+  // `scopePending` below is still here and is not redundant: two writes outstanding
+  // against one keystone resolve in an order the clicks did not choose, whatever each
+  // one says.
   const scopeMut = useMutation({
-    mutationFn: (value: boolean) =>
-      api.saveDecisionsConsent(true, view.configuredEndpoint, value),
+    mutationFn: (value: boolean) => api.saveDecisionsScope({ toolArgs: value }),
     onSettled: () => qc.invalidateQueries({ queryKey: ['decisionsConsent'] }),
   })
+  // The recalled-memory scope, on identical terms. A SECOND scope rather than a wider
+  // reading of the first: an owner may want risky tool calls flagged without the
+  // contents of their memory store leaving the machine, and only two fields can
+  // record that.
+  const memoryScopeMut = useMutation({
+    mutationFn: (value: boolean) => api.saveDecisionsScope({ memoryText: value }),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['decisionsConsent'] }),
+  })
+  // ANY scope write in flight freezes every switch on this card, the main one
+  // included. One flag rather than a per-switch check: what must not interleave is a
+  // scope write with a consent write, and with a second scope's write for the same
+  // reason -- the route records the whole keystone under one lock, so two
+  // outstanding writes resolve in an order the clicks did not choose.
+  const scopePending = scopeMut.isPending || memoryScopeMut.isPending
   // "Old gateway" and "could not read the settings" are different facts and must
   // not share a sentence: the first is a state the user fixes by updating, the
   // second by retrying. An older gateway answers the consent GET with 404, which
@@ -261,8 +284,11 @@ function DecisionsPreviewCard() {
         checked={view.enabled}
         onChange={v => mut.mutate(v)}
         // A keystone that has not been read, or could not be, is no basis for
-        // offering a write against the value it holds.
-        disabled={loading || readFailed || !view.supported || mut.isPending}
+        // offering a write against the value it holds. `scopePending` is here for a
+        // different reason: a scope write is outstanding against this same keystone,
+        // and letting the switch be clicked underneath it is what lets a losing
+        // scope write re-commit a consent the owner just withdrew.
+        disabled={loading || readFailed || !view.supported || mut.isPending || scopePending}
         describedBy={describedBy}
       />
       {/* The egress fact carries body weight, not muted fine print: it is what a
@@ -291,7 +317,45 @@ function DecisionsPreviewCard() {
           description={i18nT('pages.developer.featurePreviewsTab.decisions_tool_args_desc')}
           checked={view.toolArgs}
           onChange={v => scopeMut.mutate(v)}
-          disabled={loading || readFailed || !view.supported || mut.isPending || scopeMut.isPending}
+          disabled={loading || readFailed || !view.supported || mut.isPending || scopePending}
+        />
+      )}
+      {/* A refused scope write has to say so: the switch snaps back to the recorded
+          value on the refetch, which on its own looks like the click never landed.
+          Hand-off ON -- this card holds no draft input, and the failure is one an agent
+          can act on (an owner-only route refusing, a gateway that cannot write the
+          keystone). */}
+      {view.enabled && (
+        <ErrorNotice
+          message={scopeMut.isError ? i18nT('pages.developer.featurePreviewsTab.decisions_scope_save_failed') : null}
+          variant="inline"
+          askAgent
+          testId="decisions-tool-args-error"
+        />
+      )}
+      {/* The recalled-memory scope. Same shape, same reason, same drawn-only-while-on
+          rule as the switch above: it widens what leaves the machine, so it is a
+          consent on the keystone rather than a config value, and a consent recorded
+          before it existed reads false here so an owner who never saw this switch has
+          not granted it. */}
+      {view.enabled && (
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.decisions_memory_text')}
+          description={i18nT('pages.developer.featurePreviewsTab.decisions_memory_text_desc')}
+          checked={view.memoryText}
+          onChange={v => memoryScopeMut.mutate(v)}
+          disabled={loading || readFailed || !view.supported || mut.isPending || scopePending}
+        />
+      )}
+      {/* The same notice for the second scope, and a SEPARATE one rather than a shared
+          node: two switches whose failures render in one place would leave a reader
+          unable to tell which write was refused. */}
+      {view.enabled && (
+        <ErrorNotice
+          message={memoryScopeMut.isError ? i18nT('pages.developer.featurePreviewsTab.decisions_scope_save_failed') : null}
+          variant="inline"
+          askAgent
+          testId="decisions-memory-text-error"
         />
       )}
       {/* WHERE the messages go, as a fact beside the switch: consent is given for

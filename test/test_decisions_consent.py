@@ -236,6 +236,7 @@ class TestWrite:
             # Enabling alone consents to no tool arguments: the default is the
             # narrowest scope, so a caller that does not mention them grants none.
             "tool_args": False,
+            "memory_text": False,
         }
         assert consent.permits(CUSTOM) is True
         assert consent.permits(DEFAULT_ENDPOINT) is False
@@ -252,6 +253,7 @@ class TestWrite:
             # Cleared on the same terms as the endpoint and the ceiling, so a later
             # re-enable cannot inherit a tool-argument scope nobody re-reviewed.
             "tool_args": False,
+            "memory_text": False,
         }
         assert consent.permits(CUSTOM) is False
 
@@ -264,6 +266,7 @@ class TestWrite:
             "endpoint": DEFAULT_ENDPOINT,
             "history_budget_chars": 0,
             "tool_args": False,
+            "memory_text": False,
         }
 
     def test_records_the_history_ceiling_it_was_given(self, keystone):
@@ -469,6 +472,7 @@ class TestHandler:
             # Reported so the card draws the scope actually recorded rather than
             # inferring it from ``enabled``; absent on this keystone reads false.
             "tool_args": False,
+            "memory_text": False,
         }
         keystone.write_text(
             json.dumps({"enabled": True, "endpoint": DEFAULT_ENDPOINT}), encoding="utf-8"
@@ -577,16 +581,42 @@ class TestHandler:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "body",
-        [{"enabled": "true"}, {"enabled": 1}, {}, [], "yes", {"enabled": None}],
-        ids=["string", "int", "missing", "list", "scalar", "null"],
+        [{"enabled": "true"}, {"enabled": 1}, [], "yes", {"enabled": None}],
+        ids=["string", "int", "list", "scalar", "null"],
     )
     async def test_put_accepts_only_a_real_boolean(self, keystone, audit, configured, body):
+        """A PRESENT `enabled` must be a literal boolean; a stand-in is not consent.
+
+        An ABSENT one is a different case and is no longer here -- see
+        :meth:`test_an_omitted_enabled_preserves_the_recorded_consent`. A non-object body
+        stays a 400: that is a malformed request rather than an omission.
+        """
         from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
 
         resp = await api_decisions_consent_put(_request(body=body))
         assert resp.status == 400
         assert json.loads(resp.text)["code"] == "decisions_consent_invalid_body"
         assert not keystone.exists()
+
+    @pytest.mark.asyncio
+    async def test_an_omitted_enabled_preserves_the_recorded_consent(
+        self, keystone, audit, configured
+    ):
+        """`{}` is now a no-op rather than a 400, and that is what lets a SCOPE be
+        written without asserting anything about consent.
+
+        The card's scope switches send the scope field alone. Sending `enabled` too --
+        even the value they had just read -- is a write against a switch the owner did not
+        touch, and a read taken before a concurrent revoking PUT would re-commit a consent
+        that had been withdrawn.
+        """
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_consent_put
+
+        resp = await api_decisions_consent_put(_request(body={}))
+        assert resp.status == 200
+        # Nothing was recorded, so nothing was consented: an empty keystone stays empty
+        # of a verdict rather than acquiring `false`.
+        assert consent.is_enabled() is False
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("bad", [True, False, "2000", 2000.5, -1, [2000], {"n": 1}])
@@ -691,13 +721,14 @@ class TestHandler:
         seen: list = []
         real = consent.save_enabled
 
-        def _spy(enabled, *, endpoint, history_budget_chars=0, tool_args=False):
+        def _spy(enabled, *, endpoint, history_budget_chars=0, tool_args=False, memory_text=False):
             seen.append(history_budget_chars)
             return real(
                 enabled,
                 endpoint=endpoint,
                 history_budget_chars=history_budget_chars,
                 tool_args=tool_args,
+                memory_text=memory_text,
             )
 
         monkeypatch.setattr(consent, "save_enabled", _spy)
