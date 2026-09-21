@@ -4950,7 +4950,9 @@ class SttConfig:
             "Which speech model the local provider downloads and runs. Bigger is "
             "more accurate and a longer first-time download: `tiny` on a machine "
             "short of memory, `base` for everyone, `small` when accents or jargon "
-            "are being misheard, `large-v3-turbo` for the best accuracy available.",
+            "are being misheard, `large-v3-turbo` for the best accuracy available "
+            "-- though without native acceleration it recognises slower than you "
+            "speak, which the Voice panel now says outright.",
             enum=list(_VALID_STT_MODELS),
         ),
     )
@@ -4960,6 +4962,18 @@ class SttConfig:
             "Language Code",
             "Language for speech recognition (e.g. zh-CN, en-US). The local provider "
             "defaults to auto-detect; choosing a language can improve short dictation.",
+        ),
+    )
+    polish: bool = field(
+        default=False,
+        metadata=_meta(
+            "AI Cleanup",
+            "After dictation finishes, have your configured model fix punctuation, "
+            "capitalisation and word boundaries. Your WORDS are never changed: a "
+            "reply that altered one is discarded, so the worst case is that nothing "
+            "happens. Off by default because it sends the TRANSCRIPT (never the "
+            "audio) to that model, so a local-only setup stays local-only until you "
+            "turn this on.",
         ),
     )
     streaming: bool = field(
