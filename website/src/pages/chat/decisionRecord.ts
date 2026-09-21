@@ -5,7 +5,9 @@
  * set was chosen by asking Jev (`decisions/points/skills_select.py`) carries it on
  * the ASSISTANT row that ends the turn; a message whose mid-turn handling was
  * chosen (`decisions/points/message_steer.py`) carries it on that message's own
- * USER row, because that is what the decision was about. Both render from the
+ * USER row, because that is what the decision was about; a compaction whose tool calls
+ * were scored in the shadow (`decisions/points/compaction_keep.py`) carries it on the
+ * compaction notice row, for the same reason. All three render from the
  * record and nothing else: neither makes a request of its own to learn what
  * happened, so a transcript reloaded from disk and one that arrived live say the
  * same thing.
@@ -36,7 +38,7 @@
  */
 import type { DecisionFeedbackSide, DecisionVerdictValue } from '../../api/client'
 import type { ChatMessage } from '../../types'
-import { DECISIONS_LIVE_POINT, DECISIONS_STEER_POINT } from '../settings/decisionsPreview'
+import { DECISIONS_COMPACTION_POINT, DECISIONS_LIVE_POINT, DECISIONS_STEER_POINT } from '../settings/decisionsPreview'
 
 /** A skill the answer named that the gate then refused, with its own score. */
 export interface DecisionStripDropped {
@@ -267,6 +269,94 @@ export function readSteerRecord(raw: unknown): SteerDecisionRecord | null {
     choice,
     p,
     latencyMs: asCount(root.latency_ms),
+  }
+}
+
+/**
+ * One compaction scored in the shadow, as the line on the compaction card prints it.
+ *
+ * `point` is `compaction.keep` and is what tells this record from the other two, so it
+ * is kept rather than derived — the same reason the steer record keeps its own.
+ */
+export interface CompactionKeepRecord {
+  /** Identifies the decision this line is about; the feedback POST's subject. */
+  turnId: string
+  /** Always `compaction.keep`. */
+  point: typeof DECISIONS_COMPACTION_POINT
+  /** Tool calls the transcript held when the compaction fired. */
+  totalCalls: number
+  /** How many of them Jev would have kept, whole or call-only, pinned ones included. */
+  keptCalls: number
+  /**
+   * Tool calls the gateway's walk found past its cap and did not score, or `0`.
+   *
+   * A COUNT rather than a flag, because the line states it: "23 of 61 (+140 not
+   * scored)" is true about a capped session where a bare "23 of 61" is not — 61 is
+   * the cap, not the session's call count. `0` draws nothing extra, which is every
+   * ordinary session.
+   */
+  truncatedCalls: number
+  /**
+   * Characters Jev's keep-set would carry, as a FRACTION of everything the transcript
+   * held, or `null` when the record does not state both sides.
+   *
+   * Nullable rather than `0`, the rule `messageChars` states one interface up: a record
+   * stamped without one of the two numbers would otherwise print "0% of characters"
+   * over a keep-set that carries plenty.
+   *
+   * `null` ALSO when the fraction exceeds 1. The gateway keeps both arms on one
+   * character universe, so a share above 100% means the two were measured against
+   * different things — and the honest reading of a ratio whose denominator does not
+   * contain its numerator is "this record cannot say", not a clamp to 100%. Clamping
+   * would print a plausible number over a broken measurement, which is the one shape
+   * a receipt must not take.
+   */
+  charsShare: number | null
+}
+
+/**
+ * Validate one raw compaction record. `null` means "draw nothing".
+ *
+ * `keptCalls` is DERIVED from the three tallies rather than read as a field, the same
+ * rule `readDecisionStrip` applies to `agree`: the line prints "N of M", and a count
+ * that disagreed with the tallies beside it would be a number nobody could reconcile
+ * with the log. A record whose parts do not add up to `total_calls` is refused, because
+ * the only honest reading of a fraction is one over a denominator it was measured
+ * against — which is also why a PARTIAL answer is never stamped in the first place.
+ *
+ * `calls_truncated` is NOT a refusal, and that is the difference between a wrong
+ * number and a qualified one: the tallies describe a prefix of the session, and the
+ * line says so ("+K not scored") instead of the reader hiding a measurement that is
+ * accurate about everything it covers. It is read through `asCount`, so an absent
+ * field — every record stamped before it existed — reads as `0` and adds nothing.
+ */
+export function readCompactionKeepRecord(raw: unknown): CompactionKeepRecord | null {
+  const root = asRecord(raw)
+  if (!root) return null
+  if (root.point !== DECISIONS_COMPACTION_POINT) return null
+  const turnId = typeof root.turn_id === 'string' ? root.turn_id : ''
+  if (!turnId) return null
+  const totalCalls = asCountOrNull(root.total_calls)
+  const keptBoth = asCountOrNull(root.kept_both)
+  const keptCall = asCountOrNull(root.kept_call)
+  const dropped = asCountOrNull(root.dropped)
+  if (totalCalls === null || keptBoth === null || keptCall === null || dropped === null) return null
+  if (totalCalls === 0 || keptBoth + keptCall + dropped !== totalCalls) return null
+  const charsAll = asCountOrNull(root.chars_all)
+  const charsJev = asCountOrNull(root.chars_jev)
+  const share = charsAll !== null && charsJev !== null && charsAll > 0
+    ? charsJev / charsAll
+    : null
+  // Above 1 means the two arms were measured against different universes, which is a
+  // broken record rather than a keep-set that kept more than existed.
+  const charsShare = share !== null && share <= 1 ? share : null
+  return {
+    turnId,
+    point: DECISIONS_COMPACTION_POINT,
+    totalCalls,
+    keptCalls: keptBoth + keptCall,
+    truncatedCalls: asCount(root.calls_truncated),
+    charsShare,
   }
 }
 
