@@ -660,6 +660,21 @@ class TestEffortControl:
         provider._client.send_command.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_kiro_clear_effort_keeps_the_entry_when_the_overlay_lock_is_busy(self):
+        # Nothing changed: not the file, and not the map once the entry goes
+        # back. The handler resets the session on False, and that reset would
+        # re-read the same level through _read_cli_overlay -- a reset paid for
+        # and the old effort still in force. True is "no reset needed", which is
+        # the true answer for a no-op; the warning tells the operator to retry.
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        provider._effort_per_model = {"claude-opus-4.7": "high"}
+        with patch("kiro_crew.providers.acp._clear_cli_overlay_effort", return_value=False):
+            ok = await provider.clear_effort()
+        assert ok is True
+        assert provider._effort_per_model["claude-opus-4.7"] == "high"
+        provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_claude_clear_effort_returns_false_for_reset(self):
         # claude-agent-acp has no "reset to default" config value, so clearing
         # must return False to trigger a session reset; it must NOT push.
