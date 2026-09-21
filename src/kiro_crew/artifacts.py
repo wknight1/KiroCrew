@@ -21,8 +21,12 @@ Security
 - Slugs are validated against ``_SLUG_RE`` to block path-traversal attempts.
 - All filesystem writes go through ``Path.resolve()`` + a parent-directory
   check to prevent escapes.
-- ``security.is_sensitive_path()`` is queried before any read/write, so the
-  store cannot accidentally land under ``~/.aws``, ``~/.ssh``, etc.
+- The sensitive-path fence is queried before any read/write, so the store
+  cannot accidentally land under ``~/.aws``, ``~/.ssh``, etc. Off the event
+  loop the store's own file helpers hand it the ``realpath`` they already
+  computed (``security.is_sensitive_resolved_path()``, see ``_fence_refuses``);
+  on the loop, and for the root check and the source-file pointers, the bounded
+  ``security.is_sensitive_path()`` answers.
 - Tool invocations emit SEL audit events via ``sel().log_tool_invocation()``.
 
 The MCP tools (``artifact_save`` etc.) and HTTP handlers wrap this module --
@@ -50,6 +54,7 @@ from typing import List as _List
 
 from kiro_crew import hooks
 from kiro_crew.artifact_source import is_verifiable_root
+from kiro_crew.atomic_write import on_event_loop
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.constants import ARTIFACT_MAX_CONTENT_BYTES
 from kiro_crew.deploy.webapp_types import (  # noqa: F401 — re-export for API compatibility
@@ -63,7 +68,7 @@ from kiro_crew.deploy.webapp_types import (  # noqa: F401 — re-export for API 
 )
 from kiro_crew.metrics.events import ARTIFACTS_CREATED, emit_counter
 from kiro_crew.publish_provider import DEFAULT_PROVIDER
-from kiro_crew.security import is_sensitive_path
+from kiro_crew.security import is_sensitive_path, is_sensitive_resolved_path
 from kiro_crew.slugs import slug_hash_fallback
 
 logger = logging.getLogger(__name__)
@@ -1093,6 +1098,38 @@ def _lock_for_root(root: Path) -> threading.Lock:
             lock = threading.Lock()
             _root_locks[key] = lock
         return lock
+
+
+def _fence_refuses(resolved: Path) -> bool:
+    """Ask the sensitive-path fence about a path the store already canonicalised.
+
+    *resolved* MUST be the output of ``os.path.realpath`` computed by the caller
+    on the line above, in the same function: that is the precondition of
+    ``is_sensitive_resolved_path`` (see its docstring), and the store's file
+    helpers are pinned to it by ``test_artifacts_pathres.py``.
+
+    Off the event loop -- a ``run_in_executor`` / ``to_thread`` worker, or a
+    plain synchronous caller -- the fence is ``is_sensitive_resolved_path``: the
+    same decision against the same targets as ``is_sensitive_path``, with no
+    ``mc-pathres`` submission. ``list()`` reaches this once per ``meta.json``,
+    and the bounded gate costs two pool hops per call, so a listing over a few
+    hundred artifacts would fill the two-worker pool with resolutions of paths
+    this store has already canonicalised; the fail-closed stall then reads as a
+    sensitive-path refusal and drops healthy artifacts from the listing.
+
+    On the event loop the bounded ``is_sensitive_path`` stays in place. The
+    pre-resolved gate resolves its anchors (``$HOME`` and the override roots)
+    inline on the calling thread, and an inline ``realpath`` of a slow or wedged
+    root on the loop is exactly the stall the pool's budget exists to prevent
+    (AUTOSDE ``no-blocking-call-on-event-loop``): the anchors need not share the
+    store's mount, so the helper's own ``realpath`` of the store path does not
+    cover them. The probe is the calling thread's, so a caller earns the off-pool
+    gate by offloading, never by declaring anything -- the same stance as
+    ``atomic_write.on_event_loop``'s other users.
+    """
+    if on_event_loop():
+        return is_sensitive_path(str(resolved))
+    return is_sensitive_resolved_path(str(resolved))
 
 
 class ArtifactStore:
@@ -3218,7 +3255,7 @@ class ArtifactStore:
     def _snapshot_version(self, slug: str, version: int, src: Path) -> None:
         target = self._artifact_dir(slug) / "versions" / f"v{version}.html"
         # Defense in depth: route the read through the gated helper so the
-        # is_sensitive_path() check fires on every filesystem read, even when
+        # sensitive-path check fires on every filesystem read, even when
         # ``src`` is a store-internal path constructed by the store itself.
         # Per the security-controls rule: all file reads must go through
         # hooks.py which enforces is_sensitive_path().
@@ -3509,14 +3546,29 @@ class ArtifactStore:
         )
 
     def _read_text(self, path: Path) -> str:
+        """Read a store-internal file through the sensitive-path fence.
+
+        The fence is asked with the ``realpath`` computed on the line above (see
+        :func:`_fence_refuses` for which gate answers, and why). Handing it an
+        unresolved spelling would be a link bypass, so the ``realpath`` must stay
+        on the line above (pinned by ``test_artifacts_pathres.py``).
+        """
         resolved = Path(os.path.realpath(path))
-        if is_sensitive_path(str(resolved)):
+        if _fence_refuses(resolved):
             raise ArtifactError(f"refusing to read sensitive path: {resolved}")
         return resolved.read_text(encoding="utf-8")
 
     def _write_text(self, path: Path, text: str) -> None:
+        """Atomically write a store-internal file through the sensitive-path fence.
+
+        Same fence and same precondition as :meth:`_read_text`. This is the
+        read+write fence (``_SENSITIVE_HOME_DIRS`` plus the keystone publish
+        artifacts): the write-only superset ``is_sensitive_write_path`` guards the
+        agent's file-edit tool, has no pre-resolved form, and adopting it here
+        would change the decision rather than the submission path.
+        """
         resolved = Path(os.path.realpath(path))
-        if is_sensitive_path(str(resolved)):
+        if _fence_refuses(resolved):
             raise ArtifactError(f"refusing to write sensitive path: {resolved}")
         resolved.parent.mkdir(parents=True, exist_ok=True)
         # Atomic write: tmp file + rename.
@@ -3528,10 +3580,11 @@ class ArtifactStore:
         """Binary sibling of :meth:`_read_text` (image asset reads).
 
         Same sensitive-path gate — every store read, text or binary, must pass
-        ``is_sensitive_path`` per the security-controls rule.
+        the fence per the security-controls rule; the ``realpath`` on the line
+        above is what lets :func:`_fence_refuses` hand it the pre-resolved spelling.
         """
         resolved = Path(os.path.realpath(path))
-        if is_sensitive_path(str(resolved)):
+        if _fence_refuses(resolved):
             raise ArtifactError(f"refusing to read sensitive path: {resolved}")
         return resolved.read_bytes()
 
@@ -3574,7 +3627,7 @@ class ArtifactStore:
         never observes a half-written asset.
         """
         resolved = Path(os.path.realpath(path))
-        if is_sensitive_path(str(resolved)):
+        if _fence_refuses(resolved):
             raise ArtifactError(f"refusing to write sensitive path: {resolved}")
         resolved.parent.mkdir(parents=True, exist_ok=True)
         tmp = resolved.with_suffix(resolved.suffix + ".tmp")

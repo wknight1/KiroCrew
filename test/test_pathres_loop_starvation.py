@@ -180,6 +180,20 @@ _EXPECTED_GATE_CALL_SITES: dict[str, int] = {
     # the candidate there is what this endpoint must not do at all, since on Windows
     # it would follow a junction aimed at a share.
     "kiro_crew/dashboard/handlers/files.py": 3,
+    # ``artifacts._fence_refuses``: the one gate call the four store file helpers
+    # (``_read_text`` / ``_write_text`` / ``_read_bytes`` / ``_write_bytes``) share.
+    # Each hands it the ``os.path.realpath`` computed on the line above, in the
+    # same function, for a store-constructed path (``test_artifacts_pathres.py``
+    # pins that spelling). The thread half is ENFORCED rather than assumed: the
+    # helper asks ``atomic_write.on_event_loop()`` and keeps the bounded
+    # ``is_sensitive_path`` on the loop, so only an offloaded caller reaches this
+    # gate -- ``GET /api/artifacts`` runs ``store.list()`` on a worker for that
+    # reason, since the listing reads one ``meta.json`` per artifact and the
+    # bounded gate's two pool hops per call would otherwise fill the pool from a
+    # single listing and drop healthy artifacts on the stall. The root check and
+    # the ``source_path`` pointers (one call per request, agent-influenced input)
+    # stay on ``is_sensitive_path`` unconditionally.
+    "kiro_crew/artifacts.py": 1,
 }
 
 
