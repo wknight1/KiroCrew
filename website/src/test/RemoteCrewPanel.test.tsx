@@ -271,6 +271,72 @@ describe('RemoteCrewPanel', () => {
     expect(api.removeInstance).not.toHaveBeenCalled()
   })
 
+  it('a connected fargate crew shows its turn URL to copy, and nothing to open', async () => {
+    // RULING: a fargate crew has no dashboard and no token. The one thing its
+    // connect yields is the turn API's loopback URL, so the row offers that to
+    // copy and offers no button that would point a browser at a JSON endpoint.
+    const fargate = {
+      ...MANUAL_INSTANCE,
+      id: 'f1',
+      name: 'fargate-crew',
+      connection_method: 'fargate' as const,
+      ssh_host: '',
+      ssm_target: 'ecs:crew_0123456789abcdef0123456789abcdef_0123456789abcdef0123456789abcdef-0123456789',
+      aws_region: 'us-west-2',
+      remote_port: 8080,
+      local_port: 7790,
+      was_connected: true,
+      status: {
+        instance_id: 'f1',
+        state: 'connected' as const,
+        local_port: 7790,
+        turn_url: 'http://127.0.0.1:7790/v1/chat/completions',
+      },
+    }
+    vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [fargate] })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    renderWithProviders(<RemoteCrewPanel />)
+
+    const field = await screen.findByTestId('turn-url')
+    expect(within(field).getByText('http://127.0.0.1:7790/v1/chat/completions')).toBeInTheDocument()
+    expect(within(field).getByRole('button', { name: 'Copy the turn URL of fargate-crew' })).toBeInTheDocument()
+    // The row names the method and the ECS target it forwards to.
+    expect(screen.getByText('Fargate')).toBeInTheDocument()
+    expect(screen.getByText(/ecs:crew_0123456789abcdef/)).toBeInTheDocument()
+    // No open / dashboard affordance anywhere on the ROW (the page has other
+    // buttons whose copy mentions opening the app; the row is what RULING 2
+    // constrains).
+    const row = field.closest('[data-crew-id="f1"]') as HTMLElement
+    expect(row).not.toBeNull()
+    expect(within(row).queryByRole('button', { name: /open/i })).not.toBeInTheDocument()
+    expect(within(row).queryByRole('link')).not.toBeInTheDocument()
+    // Disconnect is the primary action of a connected row, fargate included.
+    expect(within(row).getByRole('button', { name: /Disconnect/i })).toBeInTheDocument()
+  })
+
+  it('a fargate crew that is not connected shows no turn URL', async () => {
+    // The URL is a property of the open forward, not of the record: with the
+    // tunnel down there is no port behind it, so a stale URL would invite a
+    // call that can only fail.
+    const fargate = {
+      ...MANUAL_INSTANCE,
+      id: 'f2',
+      name: 'fargate-idle',
+      connection_method: 'fargate' as const,
+      ssh_host: '',
+      ssm_target: 'ecs:crew_0123456789abcdef0123456789abcdef_0123456789abcdef0123456789abcdef-0123456789',
+      remote_port: 8080,
+      status: { instance_id: 'f2', state: 'disconnected' as const },
+    }
+    vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [fargate] })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    renderWithProviders(<RemoteCrewPanel />)
+
+    expect(await screen.findByText('fargate-idle')).toBeInTheDocument()
+    expect(screen.queryByTestId('turn-url')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Connect$/i })).toBeInTheDocument()
+  })
+
   it('still lists the crews when the gateway cannot do cloud provisioning at all', async () => {
     // A Windows gateway POSIX-gates the launch-history route, so the launches query
     // fails with 400 posix_host_required. Treating that as a load failure replaced
