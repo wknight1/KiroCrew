@@ -893,6 +893,33 @@ def mcp_search_path(env_path: str) -> str:
     return dedup_path(os.pathsep.join(filter(None, parts)))
 
 
+def mcp_runtime_path(base_path: str = "") -> str:
+    """Contributed MCP directories, then :func:`augmented_path` unchanged.
+
+    For an INHERITED process PATH such as the gateway daemon's environment.
+    ``base_path`` is not a spec-authored override, so :func:`mcp_search_path`
+    is the wrong composition here: it would treat the inherited entries as spec
+    pins and move them ahead of the managed launcher directories.
+
+    Contributed directories (``mcp.extra_path_dirs`` and
+    :func:`register_mcp_path_dirs`) LEAD, honouring the rule documented at
+    :func:`mcp_search_path`: a directory an operator or a packaged build named
+    explicitly outranks this module's built-in guesses. An operator who sets
+    the option precisely to override a wrong built-in guess must get their own
+    directory. :func:`augmented_path` then follows as one contiguous block with
+    its internal order untouched, so both spawn sites share one launcher
+    precedence and the inherited base still trails as ``augmented_path`` places
+    it. A contributed directory that duplicates a built-in guess appears once,
+    at the front. With nothing contributed the result is byte-identical to
+    ``augmented_path(base_path)``.
+    """
+    path = augmented_path(base_path)
+    extra = _dedup_dirs(_extra_mcp_path_dirs())
+    if not extra:
+        return path
+    return os.pathsep.join(_dedup_dirs([*extra, *path.split(os.pathsep)]))
+
+
 # Env keys a spec's declared ``env`` must never set on a process WE spawn.
 #
 # Both families execute attacker-controlled code in the LAUNCHER — the process
